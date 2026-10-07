@@ -1,11 +1,11 @@
 # Famlytic
 
-Famlytic is a family spending analysis web app. This first technical iteration
-provides a Python 3.12 / FastAPI foundation and an extensible PDF statement parsing
-architecture for Sber and T-Bank. It extracts PDF text with pdfplumber, detects the
-bank, and normalizes transactions using Pydantic. AI, frontend, database,
-authentication, dashboards, recommendations, and transfer matching are outside
-this iteration.
+Famlytic is a family spending analysis web app. The current MVP provides a
+Python 3.12 / FastAPI foundation, PDF statement parsing for Sber and T-Bank,
+and a separate deterministic internal-transfer matching service (Iteration 1.2).
+It extracts PDF text with pdfplumber, detects the bank, and normalizes transactions
+using Pydantic. AI, frontend, database, authentication, dashboards, categorization,
+and recommendations are outside the current scope.
 
 ## Setup and development
 
@@ -34,7 +34,63 @@ The response contains `bank`, `transactions_count`, and `transactions`. Amounts
 are positive `Decimal` values, serialized as JSON strings to preserve precision;
 `direction` is `income` or `expense`. A leading `+` denotes income; negative or
 unsigned amounts denote expenses. UUIDs are generated per parse, not stable
-transaction identities. Transfer markers only flag candidates; pairs are not matched.
+transaction identities. Parsing only flags transfer candidates; matching is a separate step.
+
+## Internal transfers (Iteration 1.2)
+
+Call `match_internal_transfers(transactions)` in
+`app/services/transfer_matcher.py`, or send normalized transactions from both
+banks to `POST /api/analyze-transfers`:
+
+```json
+{"transactions": []}
+```
+
+Replace the empty list with combined `transactions` arrays from `/api/parse`.
+Each transaction needs a unique ID. No PDF upload is required for this endpoint.
+Do not mix currencies in one batch: totals must have a single currency (case is
+normalized). Invalid batches return HTTP 422. Empty batches are supported.
+
+An eligible pair requires different banks, one expense and one income, exactly
+equal Decimal amounts, operation dates at most two days apart, and at least one
+`is_transfer_candidate` flag. Processing dates are not used. Descriptions only
+increase confidence; they never override eligibility. Recognized signals include
+`Tinkoff Card2Card`, `Тинькофф Банк`, `Пополнение. Карта другого банка`,
+`Внутрибанковский перевод`, and `SBOL` together with an explicit transfer marker.
+`SBOL` alone is not a transfer signal.
+
+The score is 50 base points, plus 25/15/5 for a 0/1/2-day gap, plus 15 for two
+candidate flags or 5 for one, plus 5 per description with a recognized signal.
+Confidence is score / 100, a heuristic score rather than a calibrated probability.
+An isolated eligible pair is `automatic` at confidence >= 0.85, otherwise `review`.
+
+The service builds a graph of all eligible pairs. Every connected component with
+multiple edges becomes an `ambiguous_groups` entry with `status: "review"` and
+all `alternatives`. These alternatives are **not assigned matches**. Even unequal
+scores do not silently resolve competing pairs. No transaction participates in
+more than one entry in `matches`. Results are independent of input order; match
+IDs are deterministic for supplied transaction IDs. Re-parsing PDFs generates
+new transaction IDs, so cross-import deduplication is not provided.
+
+The response contains `matches`, `unmatched_transfer_candidates` (IDs only),
+`ambiguous_groups`, and `statistics`. Reasons summarize rules without echoing
+statement descriptions. A candidate in an ambiguous group remains unmatched;
+a candidate in a unique review proposal is paired and no longer in the unmatched
+list, but remains in the financial totals until confirmed.
+
+`matched_internal_transfer_amount` counts automatic pairs once. Both
+`internal_transfer_outflow` and `internal_transfer_inflow` equal that amount.
+`adjusted_expense_total = raw_expense_total - internal_transfer_outflow` and
+`adjusted_income_total = raw_income_total - internal_transfer_inflow`.
+Unique review proposals and ambiguous alternatives are not subtracted. The net
+cashflow therefore stays unchanged. All money is returned as Decimal JSON strings.
+
+The service assumes the supplied accounts belong to the same family; it cannot
+verify account ownership. Coincidental equal-value transfers can still be false
+positives. Fees, split/batched transfers, same-bank transfers, delays over two
+days, and currency conversion are not matched in v1. Conservative grouping can
+send resolvable unequal-score alternatives to review. There is no confirmation
+workflow or persistence yet. Never store private normalized transactions in Git.
 
 ## Supported formats and limitations
 
@@ -67,7 +123,7 @@ PDF layouts vary: support is limited to these layouts, not all statement version
 Scanned PDFs/OCR, reordered columns, and non-RUB account/card amounts are unsupported.
 Missing processing/time rows and malformed transaction blocks return HTTP 422.
 Without recognized statement totals, reconciliation cannot prove completeness.
-Transfers are heuristic candidates only; no matching or categorization is performed.
+Parsing flags heuristic transfer candidates; it does not match pairs or categorize spending.
 Unreadable/encrypted or unknown documents return 422; files over 10 MiB return 413.
 Extraction runs outside the async event loop. The byte limit is not a PDF resource
 sandbox; public deployment would need further resource controls.
