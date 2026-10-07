@@ -8,11 +8,19 @@ class UnknownBankError(ParseError):
 
 def detect_bank(text: str) -> Bank:
     normalized = " ".join(text.casefold().split()).replace("ё", "е")
-    markers = {
-        Bank.SBER: ("индивидуальная выписка по платежному счету", "sber", "сбербанк"),
-        Bank.TBANK: ("справка о движении средств", "ао «тбанк»", "tbank.ru"),
+    # Document titles identify the issuer; bank names in transaction descriptions do not.
+    titles = {
+        Bank.SBER: ("индивидуальная выписка по платежному счету",),
+        Bank.TBANK: ("справка о движении средств",),
     }
-    matches = [bank for bank, signatures in markers.items() if any(s in normalized for s in signatures)]
-    if len(matches) != 1:
-        raise UnknownBankError("Unknown or ambiguous bank statement")
-    return matches[0]
+    markers = {
+        Bank.SBER: ("sber", "сбербанк"),
+        Bank.TBANK: ("ао «тбанк»", "tbank.ru"),
+    }
+    for signatures in (titles, markers):
+        matches = [bank for bank, values in signatures.items() if any(s in normalized for s in values)]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            break
+    raise UnknownBankError("Unknown or ambiguous bank statement")

@@ -40,3 +40,17 @@ class BankParser(ABC):
     @abstractmethod
     def parse(self, text: str) -> list[Transaction]:
         """Parse extracted statement text, raising ParseError for unsupported rows."""
+
+
+def validate_statement_totals(
+    text: str, transactions: list[Transaction], labels: dict[Direction, str]
+) -> None:
+    """Reconcile optional document summaries, without exposing values in errors."""
+    for direction, label in labels.items():
+        pattern = re.compile(rf"^\s*{label}\s*:?\s*({MONEY})\s*(?:₽|RUB|руб\.?)?\s*$", re.I | re.M)
+        matches = pattern.findall(text)
+        actual = sum((tx.amount for tx in transactions if tx.direction == direction), Decimal(0))
+        for value in matches:
+            expected = Decimal(re.sub(r"\s", "", value).replace(",", "."))
+            if expected != actual:
+                raise ParseError("Statement totals do not match parsed transactions")
