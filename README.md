@@ -2,7 +2,8 @@
 
 Famlytic is a family spending analysis web app. The current MVP provides a
 Python 3.12 / FastAPI foundation, PDF statement parsing for Sber and T-Bank,
-and a separate deterministic internal-transfer matching service (Iteration 1.2).
+a separate deterministic internal-transfer matching service (Iteration 1.2),
+and an isolated transfer review API (Iteration 1.3).
 It extracts PDF text with pdfplumber, detects the bank, and normalizes transactions
 using Pydantic. AI, frontend, database, authentication, dashboards, categorization,
 and recommendations are outside the current scope.
@@ -89,8 +90,65 @@ The service assumes the supplied accounts belong to the same family; it cannot
 verify account ownership. Coincidental equal-value transfers can still be false
 positives. Fees, split/batched transfers, same-bank transfers, delays over two
 days, and currency conversion are not matched in v1. Conservative grouping can
-send resolvable unequal-score alternatives to review. There is no confirmation
-workflow or persistence yet. Never store private normalized transactions in Git.
+send resolvable unequal-score alternatives to review. The review workflow below confirms individual proposals; durable persistence is
+not implemented. Never store private normalized transactions in Git.
+
+## Transfer review (Iteration 1.3)
+
+Create a review analysis using `POST /api/transfers/review` with the same
+`{"transactions": [...]}` body as matching. HTTP 201 returns a unique
+`analysis_id`, sanitized `candidates`, `ambiguous_groups`, unmatched candidate
+transaction IDs, and a recalculated `summary`.
+
+Use the returned analysis ID for every subsequent request:
+
+```text
+GET  /api/transfers/review?analysis_id=<analysis_id>
+POST /api/transfers/<candidate_id>/confirm?analysis_id=<analysis_id>
+POST /api/transfers/<candidate_id>/reject?analysis_id=<analysis_id>
+```
+
+Each possible pairing has its own candidate ID. Group `candidate_ids` reference
+all alternatives in the top-level `candidates` list, including resolved and
+unavailable options for audit. No ambiguous pairing is automatically selected.
+
+Candidate status transitions:
+
+- `pending` -> `confirmed_internal`: reserve both transactions and subtract the
+  amount from both income and expenses.
+- `pending` -> `rejected`: leave transactions in normal totals. Rejection applies
+  to that pairing, not every alternative involving its transactions.
+- `automatic`: already excluded, stays automatic, and cannot be rejected.
+
+Confirmed pairs cannot be rejected; rejected pairs cannot be confirmed (HTTP 409).
+Repeating the same completed action is idempotent. Unknown analysis/candidate IDs
+return 404; missing analysis IDs and invalid transaction batches return 422.
+Confirmation reserves transaction IDs atomically, including across concurrent
+requests. Competing pending options become `available: false` with a generic
+reason; attempts to act on them return 409. A disjoint remaining option stays
+pending even if the group is no longer ambiguous. Nothing auto-confirms after a
+rejection or a competing confirmation.
+
+The summary separates `automatic_transfer_outflow/inflow` from
+`confirmed_transfer_outflow/inflow`. Adjusted totals subtract both, exactly once.
+Raw totals remain unchanged. `pending_transfer_candidates_count` counts available
+pending **pair options**, including ambiguous alternatives, not unique transactions
+or unmatched transactions with no partner. `ambiguous_groups_count` counts groups
+where available pending options still compete for a transaction. Historical group
+entries remain in the response with `is_ambiguous: false` after resolution.
+`review_pairs_count` counts available pending pairs originally outside groups.
+Unmatched flagged transaction IDs exclude reserved transactions and isolated
+pending review pairs; unresolved group participants and rejected candidates remain
+unmatched. No descriptions, owners, card/account numbers, or original transactions
+are retained in the review store or returned by the review API.
+
+Review sessions are process-local memory state, isolated by `analysis_id`; creating
+another analysis never overwrites existing decisions. There are no disk writes or
+database. Run one API worker: restarts/reload lose review state, and workers do not
+share it. Analysis IDs are scoping identifiers, not user authentication. The API is
+for the current local MVP; durable/multi-user review is outside this iteration.
+Re-importing statements creates another analysis and does not carry decisions over.
+The original `/api/analyze-transfers` endpoint remains stateless and unchanged.
 
 ## Supported formats and limitations
 
